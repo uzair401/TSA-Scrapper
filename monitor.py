@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -31,6 +32,8 @@ class MonitorConfig:
     debug_dir: Path
     log_path: Path
     discord_webhook_url: str
+    alerts_enabled: bool
+    server_name: str
     questdb_url: str
     questdb_username: str
     questdb_password: str
@@ -90,6 +93,13 @@ def parse_args() -> argparse.Namespace:
 
 def build_config(args: argparse.Namespace) -> MonitorConfig:
     discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "")
+    alerts_enabled = os.getenv("ALERTS_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    server_name = os.getenv("SERVER_NAME", socket.gethostname())
     questdb_url = os.getenv("QUESTDB_URL", "http://localhost:9000")
     questdb_username = os.getenv("QUESTDB_USERNAME", "")
     questdb_password = os.getenv("QUESTDB_PASSWORD", "")
@@ -103,6 +113,8 @@ def build_config(args: argparse.Namespace) -> MonitorConfig:
         debug_dir=args.debug_dir,
         log_path=args.log_path,
         discord_webhook_url=discord_webhook_url,
+        alerts_enabled=alerts_enabled,
+        server_name=server_name,
         questdb_url=questdb_url,
         questdb_username=questdb_username,
         questdb_password=questdb_password,
@@ -218,13 +230,14 @@ def compute_retry_delay(poll_interval_seconds: int, consecutive_failures: int) -
     return min(300 * (2**exponent), 3600)
 
 
-def format_update_message(latest_row: dict, warnings: list[str]) -> str:
+def format_update_message(latest_row: dict, warnings: list[str], server_name: str) -> str:
     detected_at = utc_now_iso().replace("T", " ").replace("Z", " UTC")
     lines = [
         "🛫 New TSA Checkpoint Data Detected",
         f"Date: {latest_row['date']}",
         f"Travelers: {int(latest_row['travelers']):,}",
         f"Detected at: {detected_at}",
+        f"Source: {server_name}",
     ]
 
     for warning in warnings:
@@ -331,16 +344,21 @@ async def run_monitor(config: MonitorConfig) -> None:
                                 logging.error("QuestDB insert failed; state will not advance.")
 
                         if record.get("db_inserted", False) and not record.get("discord_sent", False):
-                            message = format_update_message(
-                                validation.newest_row,
-                                validation.warnings,
-                            )
-                            sent = await discord_client.send_message(message)
-                            record["discord_sent"] = bool(sent)
-                            if sent:
-                                logging.info("Discord notification sent.")
+                            if config.alerts_enabled:
+                                message = format_update_message(
+                                    validation.newest_row,
+                                    validation.warnings,
+                                    config.server_name,
+                                )
+                                sent = await discord_client.send_message(message)
+                                record["discord_sent"] = bool(sent)
+                                if sent:
+                                    logging.info("Discord notification sent.")
+                                else:
+                                    logging.error("Discord notification failed.")
                             else:
-                                logging.error("Discord notification failed.")
+                                record["discord_sent"] = True
+                                logging.info("Alerts disabled on this node; skipping Discord send.")
 
                         save_updates(config.updates_path, updates_payload)
 
@@ -419,9 +437,12 @@ async def main() -> None:
     setup_logging(config.log_path)
 
     logging.info(
-        "Starting TSA monitor. target=%s poll_interval=%ss questdb=%s auth=%s updates=%s",
+        "Starting TSA monitor. target=%s poll_interval=%ss server=%s alerts=%s "
+        "questdb=%s auth=%s updates=%s",
         config.target_url,
         config.poll_interval_seconds,
+        config.server_name,
+        config.alerts_enabled,
         config.questdb_url,
         "enabled" if config.questdb_username else "disabled",
         config.updates_path,
