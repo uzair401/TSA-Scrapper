@@ -8,9 +8,18 @@ import httpx
 
 
 class QuestDBClient:
-    def __init__(self, base_url: str, timeout_seconds: float = 15.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: float = 15.0,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=timeout_seconds)
+        auth = None
+        if username:
+            auth = (username, password or "")
+        self._client = httpx.AsyncClient(timeout=timeout_seconds, auth=auth)
 
     async def close(self) -> None:
         await self._client.aclose()

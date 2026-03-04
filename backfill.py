@@ -156,7 +156,13 @@ async def main() -> None:
         raise SystemExit("end-year must be greater than or equal to start-year")
 
     questdb_url = os.getenv("QUESTDB_URL", "http://localhost:9000")
-    questdb = QuestDBClient(questdb_url)
+    questdb_username = os.getenv("QUESTDB_USERNAME", "")
+    questdb_password = os.getenv("QUESTDB_PASSWORD", "")
+    questdb = QuestDBClient(
+        questdb_url,
+        username=questdb_username or None,
+        password=questdb_password or None,
+    )
 
     total_inserted = 0
     total_skipped = 0

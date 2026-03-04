@@ -32,6 +32,8 @@ class MonitorConfig:
     log_path: Path
     discord_webhook_url: str
     questdb_url: str
+    questdb_username: str
+    questdb_password: str
     run_once: bool
 
 
@@ -89,6 +91,8 @@ def parse_args() -> argparse.Namespace:
 def build_config(args: argparse.Namespace) -> MonitorConfig:
     discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "")
     questdb_url = os.getenv("QUESTDB_URL", "http://localhost:9000")
+    questdb_username = os.getenv("QUESTDB_USERNAME", "")
+    questdb_password = os.getenv("QUESTDB_PASSWORD", "")
 
     return MonitorConfig(
         target_url=args.target_url,
@@ -100,6 +104,8 @@ def build_config(args: argparse.Namespace) -> MonitorConfig:
         log_path=args.log_path,
         discord_webhook_url=discord_webhook_url,
         questdb_url=questdb_url,
+        questdb_username=questdb_username,
+        questdb_password=questdb_password,
         run_once=args.once,
     )
 
@@ -232,7 +238,11 @@ async def run_monitor(config: MonitorConfig) -> None:
     updates_payload = load_updates(config.updates_path)
     save_updates(config.updates_path, updates_payload)
     discord_client = DiscordClient(config.discord_webhook_url)
-    questdb_client = QuestDBClient(config.questdb_url)
+    questdb_client = QuestDBClient(
+        config.questdb_url,
+        username=config.questdb_username or None,
+        password=config.questdb_password or None,
+    )
 
     poll_number = 0
     consecutive_failures = 0
@@ -409,10 +419,11 @@ async def main() -> None:
     setup_logging(config.log_path)
 
     logging.info(
-        "Starting TSA monitor. target=%s poll_interval=%ss questdb=%s updates=%s",
+        "Starting TSA monitor. target=%s poll_interval=%ss questdb=%s auth=%s updates=%s",
         config.target_url,
         config.poll_interval_seconds,
         config.questdb_url,
+        "enabled" if config.questdb_username else "disabled",
         config.updates_path,
     )
 
