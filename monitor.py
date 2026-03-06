@@ -10,7 +10,7 @@ import logging
 import os
 import socket
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -26,6 +26,9 @@ from validator import merge_recent_rows, validate_snapshot
 class MonitorConfig:
     target_url: str
     poll_interval_seconds: int
+    peak_poll_interval_seconds: int
+    peak_window_start_utc: str
+    peak_window_end_utc: str
     timeout_ms: int
     state_path: Path
     updates_path: Path
@@ -103,10 +106,18 @@ def build_config(args: argparse.Namespace) -> MonitorConfig:
     questdb_url = os.getenv("QUESTDB_URL", "http://localhost:9000")
     questdb_username = os.getenv("QUESTDB_USERNAME", "")
     questdb_password = os.getenv("QUESTDB_PASSWORD", "")
+    peak_poll_interval_seconds = int(
+        os.getenv("PEAK_POLL_INTERVAL_SECONDS", "10")
+    )
+    peak_window_start_utc = os.getenv("PEAK_WINDOW_START_UTC", "11:00")
+    peak_window_end_utc = os.getenv("PEAK_WINDOW_END_UTC", "15:00")
 
     return MonitorConfig(
         target_url=args.target_url,
         poll_interval_seconds=max(1, int(args.poll_interval_seconds)),
+        peak_poll_interval_seconds=max(1, peak_poll_interval_seconds),
+        peak_window_start_utc=peak_window_start_utc.strip(),
+        peak_window_end_utc=peak_window_end_utc.strip(),
         timeout_ms=max(1_000, int(args.timeout_ms)),
         state_path=args.state_path,
         updates_path=args.updates_path,
@@ -120,6 +131,32 @@ def build_config(args: argparse.Namespace) -> MonitorConfig:
         questdb_password=questdb_password,
         run_once=args.once,
     )
+
+
+def parse_hhmm_utc(value: str, label: str) -> time:
+    try:
+        hour_text, minute_text = value.split(":")
+        parsed = time(hour=int(hour_text), minute=int(minute_text))
+        return parsed
+    except Exception as exc:
+        raise ValueError(f"Invalid {label}: {value!r}. Expected HH:MM in UTC.") from exc
+
+
+def is_peak_window_utc(now_utc: datetime, start_utc: time, end_utc: time) -> bool:
+    current = now_utc.time().replace(second=0, microsecond=0)
+    if start_utc <= end_utc:
+        return start_utc <= current <= end_utc
+    return current >= start_utc or current <= end_utc
+
+
+def active_poll_interval_seconds(config: MonitorConfig) -> tuple[int, str]:
+    start_utc = parse_hhmm_utc(config.peak_window_start_utc, "PEAK_WINDOW_START_UTC")
+    end_utc = parse_hhmm_utc(config.peak_window_end_utc, "PEAK_WINDOW_END_UTC")
+    now_utc = datetime.now(tz=timezone.utc)
+
+    if is_peak_window_utc(now_utc, start_utc, end_utc):
+        return config.peak_poll_interval_seconds, "peak"
+    return config.poll_interval_seconds, "offpeak"
 
 
 def setup_logging(log_path: Path) -> None:
@@ -273,12 +310,15 @@ async def run_monitor(config: MonitorConfig) -> None:
             poll_number += 1
             recent_rows_limit = 5 if poll_number % 10 == 0 else 1
             cycle_success = False
+            base_interval_seconds, interval_mode = active_poll_interval_seconds(config)
 
             logging.info(
-                "Poll %s started. target=%s recent_rows_limit=%s",
+                "Poll %s started. target=%s recent_rows_limit=%s interval_mode=%s base_interval_seconds=%s",
                 poll_number,
                 config.target_url,
                 recent_rows_limit,
+                interval_mode,
+                base_interval_seconds,
             )
 
             try:
@@ -398,11 +438,11 @@ async def run_monitor(config: MonitorConfig) -> None:
             if cycle_success:
                 consecutive_failures = 0
                 monitor_failure_alert_sent = False
-                delay_seconds = config.poll_interval_seconds
+                delay_seconds = base_interval_seconds
             else:
                 consecutive_failures += 1
                 delay_seconds = compute_retry_delay(
-                    config.poll_interval_seconds,
+                    base_interval_seconds,
                     consecutive_failures,
                 )
 
@@ -436,11 +476,20 @@ async def main() -> None:
     config = build_config(args)
     setup_logging(config.log_path)
 
+    try:
+        parse_hhmm_utc(config.peak_window_start_utc, "PEAK_WINDOW_START_UTC")
+        parse_hhmm_utc(config.peak_window_end_utc, "PEAK_WINDOW_END_UTC")
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     logging.info(
-        "Starting TSA monitor. target=%s poll_interval=%ss server=%s alerts=%s "
-        "questdb=%s auth=%s updates=%s",
+        "Starting TSA monitor. target=%s poll_interval=%ss peak_poll_interval=%ss "
+        "peak_window_utc=%s-%s server=%s alerts=%s questdb=%s auth=%s updates=%s",
         config.target_url,
         config.poll_interval_seconds,
+        config.peak_poll_interval_seconds,
+        config.peak_window_start_utc,
+        config.peak_window_end_utc,
         config.server_name,
         config.alerts_enabled,
         config.questdb_url,
