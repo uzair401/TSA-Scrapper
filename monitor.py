@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
@@ -29,6 +30,7 @@ class MonitorConfig:
     peak_poll_interval_seconds: int
     peak_window_start_utc: str
     peak_window_end_utc: str
+    proxies_only_in_peak: bool
     timeout_ms: int
     state_path: Path
     updates_path: Path
@@ -40,7 +42,14 @@ class MonitorConfig:
     questdb_url: str
     questdb_username: str
     questdb_password: str
+    workers: list["MonitorWorker"]
     run_once: bool
+
+
+@dataclass
+class MonitorWorker:
+    name: str
+    proxy_url: str | None = None
 
 
 def utc_now_iso() -> str:
@@ -94,14 +103,46 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_bool(value: str, default: bool = False) -> bool:
+    text = (value or "").strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "on"}
+
+
+def parse_proxy_urls(raw_value: str) -> list[str]:
+    raw = (raw_value or "").strip()
+    if not raw:
+        return []
+    parts = [part.strip() for part in re.split(r"[;\n]+", raw) if part.strip()]
+    return parts
+
+
+def build_workers() -> list[MonitorWorker]:
+    workers: list[MonitorWorker] = []
+
+    include_direct = parse_bool(os.getenv("ENABLE_DIRECT_WORKER", "true"), default=True)
+    if include_direct:
+        workers.append(MonitorWorker(name="direct", proxy_url=None))
+
+    proxy_urls = parse_proxy_urls(os.getenv("PROXY_URLS", ""))
+    proxy_names = [item.strip() for item in os.getenv("PROXY_NAMES", "").split(",") if item.strip()]
+
+    for index, proxy_url in enumerate(proxy_urls, start=1):
+        worker_name = proxy_names[index - 1] if index - 1 < len(proxy_names) else f"proxy-{index}"
+        workers.append(MonitorWorker(name=worker_name, proxy_url=proxy_url))
+
+    if not workers:
+        raise ValueError(
+            "No workers configured. Enable direct worker or provide PROXY_URLS."
+        )
+
+    return workers
+
+
 def build_config(args: argparse.Namespace) -> MonitorConfig:
     discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "")
-    alerts_enabled = os.getenv("ALERTS_ENABLED", "true").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    alerts_enabled = parse_bool(os.getenv("ALERTS_ENABLED", "true"), default=True)
     server_name = os.getenv("SERVER_NAME", socket.gethostname())
     questdb_url = os.getenv("QUESTDB_URL", "http://localhost:9000")
     questdb_username = os.getenv("QUESTDB_USERNAME", "")
@@ -111,6 +152,17 @@ def build_config(args: argparse.Namespace) -> MonitorConfig:
     )
     peak_window_start_utc = os.getenv("PEAK_WINDOW_START_UTC", "11:00")
     peak_window_end_utc = os.getenv("PEAK_WINDOW_END_UTC", "15:00")
+    proxies_only_in_peak = parse_bool(
+        os.getenv("PROXIES_ONLY_IN_PEAK", "false"),
+        default=False,
+    )
+    workers = build_workers()
+
+    if proxies_only_in_peak and not any(worker.proxy_url is None for worker in workers):
+        raise ValueError(
+            "PROXIES_ONLY_IN_PEAK=true requires ENABLE_DIRECT_WORKER=true "
+            "so off-peak has at least one active worker."
+        )
 
     return MonitorConfig(
         target_url=args.target_url,
@@ -118,6 +170,7 @@ def build_config(args: argparse.Namespace) -> MonitorConfig:
         peak_poll_interval_seconds=max(1, peak_poll_interval_seconds),
         peak_window_start_utc=peak_window_start_utc.strip(),
         peak_window_end_utc=peak_window_end_utc.strip(),
+        proxies_only_in_peak=proxies_only_in_peak,
         timeout_ms=max(1_000, int(args.timeout_ms)),
         state_path=args.state_path,
         updates_path=args.updates_path,
@@ -129,6 +182,7 @@ def build_config(args: argparse.Namespace) -> MonitorConfig:
         questdb_url=questdb_url,
         questdb_username=questdb_username,
         questdb_password=questdb_password,
+        workers=workers,
         run_once=args.once,
     )
 
@@ -157,6 +211,18 @@ def active_poll_interval_seconds(config: MonitorConfig) -> tuple[int, str]:
     if is_peak_window_utc(now_utc, start_utc, end_utc):
         return config.peak_poll_interval_seconds, "peak"
     return config.poll_interval_seconds, "offpeak"
+
+
+def active_workers(config: MonitorConfig, interval_mode: str) -> list[MonitorWorker]:
+    if not config.proxies_only_in_peak or interval_mode == "peak":
+        return config.workers
+
+    direct_workers = [worker for worker in config.workers if worker.proxy_url is None]
+    if direct_workers:
+        return direct_workers
+
+    # Safety fallback; build_config should already prevent this state.
+    return config.workers
 
 
 def setup_logging(log_path: Path) -> None:
@@ -283,6 +349,43 @@ def format_update_message(latest_row: dict, warnings: list[str], server_name: st
     return "\n".join(lines)
 
 
+def best_snapshot(snapshots: list[dict]) -> dict:
+    return max(
+        snapshots,
+        key=lambda item: (
+            item["latest_row"]["date_iso"],
+            int(item.get("row_count", 0)),
+        ),
+    )
+
+
+async def scrape_worker_snapshot(
+    config: MonitorConfig,
+    worker: MonitorWorker,
+    recent_rows_limit: int,
+    poll_number: int,
+) -> dict:
+    snapshot = await scrape_monitor_snapshot(
+        target_url=config.target_url,
+        debug_prefix=f"monitor_{worker.name}",
+        recent_rows_limit=recent_rows_limit,
+        proxy_url=worker.proxy_url,
+        timeout_ms=config.timeout_ms,
+        debug_dir=config.debug_dir,
+    )
+    snapshot["worker_name"] = worker.name
+    snapshot["worker_proxy"] = bool(worker.proxy_url)
+    logging.info(
+        "Poll %s worker=%s success status=%s row_count=%s latest_date=%s",
+        poll_number,
+        worker.name,
+        snapshot.get("status_code"),
+        snapshot["row_count"],
+        snapshot["latest_row"]["date_iso"],
+    )
+    return snapshot
+
+
 async def run_monitor(config: MonitorConfig) -> None:
     state = load_state(config.state_path)
     updates_payload = load_updates(config.updates_path)
@@ -311,29 +414,54 @@ async def run_monitor(config: MonitorConfig) -> None:
             recent_rows_limit = 5 if poll_number % 10 == 0 else 1
             cycle_success = False
             base_interval_seconds, interval_mode = active_poll_interval_seconds(config)
+            workers_for_poll = active_workers(config, interval_mode)
 
             logging.info(
-                "Poll %s started. target=%s recent_rows_limit=%s interval_mode=%s base_interval_seconds=%s",
+                "Poll %s started. target=%s workers=%s recent_rows_limit=%s interval_mode=%s base_interval_seconds=%s",
                 poll_number,
                 config.target_url,
+                len(workers_for_poll),
                 recent_rows_limit,
                 interval_mode,
                 base_interval_seconds,
             )
 
             try:
-                snapshot = await scrape_monitor_snapshot(
-                    target_url=config.target_url,
-                    debug_prefix="monitor",
-                    recent_rows_limit=recent_rows_limit,
-                    timeout_ms=config.timeout_ms,
-                    debug_dir=config.debug_dir,
+                worker_tasks = [
+                    scrape_worker_snapshot(
+                        config=config,
+                        worker=worker,
+                        recent_rows_limit=recent_rows_limit,
+                        poll_number=poll_number,
+                    )
+                    for worker in workers_for_poll
+                ]
+                results = await asyncio.gather(
+                    *worker_tasks,
+                    return_exceptions=True,
                 )
+                snapshots: list[dict] = []
+                for worker, result in zip(workers_for_poll, results):
+                    if isinstance(result, Exception):
+                        logging.error(
+                            "Poll %s worker=%s error: %s",
+                            poll_number,
+                            worker.name,
+                            result,
+                        )
+                        continue
+                    snapshots.append(result)
+
+                if not snapshots:
+                    raise ScrapeError("All workers failed in this poll cycle.")
+
+                snapshot = best_snapshot(snapshots)
                 latest_row = snapshot["latest_row"]
 
                 logging.info(
-                    "Poll %s scrape success. status=%s row_count=%s latest_date=%s travelers=%s",
+                    "Poll %s selected worker=%s status=%s row_count=%s latest_date=%s travelers=%s",
                     poll_number,
+                    snapshot.get("worker_name"),
                     snapshot.get("status_code"),
                     snapshot["row_count"],
                     latest_row["date_iso"],
@@ -388,7 +516,7 @@ async def run_monitor(config: MonitorConfig) -> None:
                                 message = format_update_message(
                                     validation.newest_row,
                                     validation.warnings,
-                                    config.server_name,
+                                    f"{config.server_name}/{snapshot.get('worker_name', 'unknown')}",
                                 )
                                 sent = await discord_client.send_message(message)
                                 record["discord_sent"] = bool(sent)
@@ -484,14 +612,17 @@ async def main() -> None:
 
     logging.info(
         "Starting TSA monitor. target=%s poll_interval=%ss peak_poll_interval=%ss "
-        "peak_window_utc=%s-%s server=%s alerts=%s questdb=%s auth=%s updates=%s",
+        "peak_window_utc=%s-%s proxies_only_in_peak=%s server=%s alerts=%s "
+        "workers_total=%s questdb=%s auth=%s updates=%s",
         config.target_url,
         config.poll_interval_seconds,
         config.peak_poll_interval_seconds,
         config.peak_window_start_utc,
         config.peak_window_end_utc,
+        config.proxies_only_in_peak,
         config.server_name,
         config.alerts_enabled,
+        len(config.workers),
         config.questdb_url,
         "enabled" if config.questdb_username else "disabled",
         config.updates_path,
