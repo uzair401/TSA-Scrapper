@@ -333,14 +333,21 @@ def compute_retry_delay(poll_interval_seconds: int, consecutive_failures: int) -
     return min(300 * (2**exponent), 3600)
 
 
-def format_update_message(latest_row: dict, warnings: list[str], server_name: str) -> str:
+def format_update_message(
+    latest_row: dict,
+    warnings: list[str],
+    server_name: str,
+    worker_name: str,
+    via_proxy: bool,
+) -> str:
     detected_at = utc_now_iso().replace("T", " ").replace("Z", " UTC")
     lines = [
         "🛫 New TSA Checkpoint Data Detected",
         f"Date: {latest_row['date']}",
         f"Travelers: {int(latest_row['travelers']):,}",
         f"Detected at: {detected_at}",
-        f"Source: {server_name}",
+        f"Source Server: {server_name}",
+        f"First Seen By: {worker_name} ({'proxy' if via_proxy else 'direct'})",
     ]
 
     for warning in warnings:
@@ -516,7 +523,9 @@ async def run_monitor(config: MonitorConfig) -> None:
                                 message = format_update_message(
                                     validation.newest_row,
                                     validation.warnings,
-                                    f"{config.server_name}/{snapshot.get('worker_name', 'unknown')}",
+                                    config.server_name,
+                                    snapshot.get("worker_name", "unknown"),
+                                    bool(snapshot.get("worker_proxy", False)),
                                 )
                                 sent = await discord_client.send_message(message)
                                 record["discord_sent"] = bool(sent)
