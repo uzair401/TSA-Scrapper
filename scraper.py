@@ -7,7 +7,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -131,10 +131,31 @@ def _normalize_recent_rows(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=lambda item: item["date_iso"], reverse=True)
 
 
+def _build_playwright_proxy(proxy_url: str) -> dict:
+    raw = (proxy_url or "").strip()
+    if not raw:
+        raise ScrapeError("Proxy URL is empty.")
+
+    if "://" not in raw:
+        raw = f"http://{raw}"
+
+    parsed = urlparse(raw)
+    if not parsed.hostname or not parsed.port:
+        raise ScrapeError(f"Invalid proxy URL (hostname/port missing): {proxy_url!r}")
+
+    proxy = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username is not None:
+        proxy["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        proxy["password"] = unquote(parsed.password)
+    return proxy
+
+
 async def scrape_monitor_snapshot(
     target_url: str,
     debug_prefix: str,
     recent_rows_limit: int = 1,
+    proxy_url: str | None = None,
     headful: bool = False,
     timeout_ms: int = PAGE_TIMEOUT_MS,
     debug_dir: Path = Path("debug_artifacts"),
@@ -145,9 +166,12 @@ async def scrape_monitor_snapshot(
 
     cache_buster = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     request_url = _append_cache_buster(target_url, cache_buster)
+    launch_kwargs: dict = {"headless": not headful}
+    if proxy_url:
+        launch_kwargs["proxy"] = _build_playwright_proxy(proxy_url)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=not headful)
+        browser = await pw.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             user_agent=DEFAULT_UA,
             locale="en-US",
