@@ -169,11 +169,9 @@ def _build_httpx_proxy(proxy_config: dict | None) -> tuple[dict[str, str] | None
 
 
 async def _fetch_ip_metadata(proxies: dict[str, str] | None, auth: tuple[str, str] | None) -> dict:
-    if not proxies:
-        proxies = None
     try:
-        async with httpx.AsyncClient(proxies=proxies, auth=auth, timeout=10.0) as client:
-            response = await client.get("https://ipinfo.io/json")
+        async with httpx.AsyncClient(auth=auth, timeout=10.0) as client:
+            response = await client.get("https://ipinfo.io/json", proxies=proxies)
             response.raise_for_status()
             payload = response.json()
             return {
