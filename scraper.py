@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import httpx
 import logging
 import re
 from datetime import datetime, timezone
@@ -152,36 +151,18 @@ def _build_playwright_proxy(proxy_url: str) -> dict:
     return proxy
 
 
-def _build_httpx_proxy(proxy_config: dict | None) -> tuple[dict[str, str] | None, tuple[str, str] | None]:
-    if not proxy_config:
-        return None, None
-    server = proxy_config.get("server")
-    if not server:
-        return None, None
-
-    proxies = {"http://": server, "https://": server}
-    auth = None
-    username = proxy_config.get("username")
-    password = proxy_config.get("password")
-    if username is not None and password is not None:
-        auth = (username, password)
-    return proxies, auth
-
-
-async def _fetch_ip_metadata(proxies: dict[str, str] | None, auth: tuple[str, str] | None) -> dict:
+async def _fetch_ip_metadata(context) -> dict:
     try:
-        async with httpx.AsyncClient(auth=auth, timeout=10.0) as client:
-            response = await client.get("https://ipinfo.io/json", proxies=proxies)
-            response.raise_for_status()
-            payload = response.json()
-            return {
-                "ip": payload.get("ip"),
-                "city": payload.get("city"),
-                "region": payload.get("region"),
-                "country": payload.get("country"),
-                "org": payload.get("org"),
-                "loc": payload.get("loc"),
-            }
+        response = await context.request.get("https://ipinfo.io/json", timeout=10_000)
+        payload = await response.json()
+        return {
+            "ip": payload.get("ip"),
+            "city": payload.get("city"),
+            "region": payload.get("region"),
+            "country": payload.get("country"),
+            "org": payload.get("org"),
+            "loc": payload.get("loc"),
+        }
     except Exception as exc:
         logging.warning("Failed to fetch IP metadata: %s", exc)
     return {}
@@ -255,8 +236,7 @@ async def scrape_monitor_snapshot(
                 "via": response.headers.get("via") if response else None,
                 "cf_ray": response.headers.get("cf-ray") if response else None,
             }
-            proxies, proxy_auth = _build_httpx_proxy(proxy_config)
-            ip_metadata = await _fetch_ip_metadata(proxies=proxies, auth=proxy_auth)
+            ip_metadata = await _fetch_ip_metadata(context)
 
             return {
                 "target_url": target_url,
