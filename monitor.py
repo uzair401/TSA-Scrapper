@@ -551,15 +551,15 @@ async def run_monitor(config: MonitorConfig) -> None:
 
                         if record.get("db_inserted", False) and not record.get("discord_sent", False):
                             if config.alerts_enabled:
-                            message = format_update_message(
-                                validation.newest_row,
-                                validation.warnings,
-                                config.server_name,
-                                snapshot.get("worker_name", "unknown"),
-                                bool(snapshot.get("worker_proxy", False)),
-                                snapshot.get("ip_metadata"),
-                                snapshot.get("cdn_metadata"),
-                            )
+                                message = format_update_message(
+                                    validation.newest_row,
+                                    validation.warnings,
+                                    config.server_name,
+                                    snapshot.get("worker_name", "unknown"),
+                                    bool(snapshot.get("worker_proxy", False)),
+                                    snapshot.get("ip_metadata"),
+                                    snapshot.get("cdn_metadata"),
+                                )
                                 sent = await discord_client.send_message(message)
                                 record["discord_sent"] = bool(sent)
                                 if sent:
