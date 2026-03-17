@@ -339,6 +339,8 @@ def format_update_message(
     server_name: str,
     worker_name: str,
     via_proxy: bool,
+    ip_metadata: dict | None,
+    cdn_metadata: dict | None,
 ) -> str:
     detected_at = utc_now_iso().replace("T", " ").replace("Z", " UTC")
     lines = [
@@ -349,6 +351,35 @@ def format_update_message(
         f"Source Server: {server_name}",
         f"First Seen By: {worker_name} ({'proxy' if via_proxy else 'direct'})",
     ]
+
+    if ip_metadata:
+        ip_parts = []
+        if ip_metadata.get("city"):
+            ip_parts.append(ip_metadata["city"])
+        if ip_metadata.get("region"):
+            ip_parts.append(ip_metadata["region"])
+        if ip_metadata.get("country"):
+            ip_parts.append(ip_metadata["country"])
+        loc = ", ".join(ip_parts)
+        ip_line = f"Worker IP: {ip_metadata.get('ip', 'unknown')}"
+        if loc:
+            ip_line += f" ({loc})"
+        if ip_metadata.get("org"):
+            ip_line += f" via {ip_metadata['org']}"
+        lines.append(ip_line)
+
+    if cdn_metadata:
+        details = []
+        if cdn_metadata.get("hostname"):
+            details.append(f"host={cdn_metadata['hostname']}")
+        if cdn_metadata.get("server"):
+            details.append(f"server={cdn_metadata['server']}")
+        if cdn_metadata.get("via"):
+            details.append(f"via={cdn_metadata['via']}")
+        if cdn_metadata.get("cf_ray"):
+            details.append(f"cf-ray={cdn_metadata['cf_ray']}")
+        if details:
+            lines.append("CDN Info: " + " | ".join(details))
 
     for warning in warnings:
         lines.append(f"⚠️ Warning: {warning}")
@@ -520,13 +551,15 @@ async def run_monitor(config: MonitorConfig) -> None:
 
                         if record.get("db_inserted", False) and not record.get("discord_sent", False):
                             if config.alerts_enabled:
-                                message = format_update_message(
-                                    validation.newest_row,
-                                    validation.warnings,
-                                    config.server_name,
-                                    snapshot.get("worker_name", "unknown"),
-                                    bool(snapshot.get("worker_proxy", False)),
-                                )
+                            message = format_update_message(
+                                validation.newest_row,
+                                validation.warnings,
+                                config.server_name,
+                                snapshot.get("worker_name", "unknown"),
+                                bool(snapshot.get("worker_proxy", False)),
+                                snapshot.get("ip_metadata"),
+                                snapshot.get("cdn_metadata"),
+                            )
                                 sent = await discord_client.send_message(message)
                                 record["discord_sent"] = bool(sent)
                                 if sent:

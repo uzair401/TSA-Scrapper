@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import httpx
 import logging
 import re
 from datetime import datetime, timezone
@@ -151,6 +152,43 @@ def _build_playwright_proxy(proxy_url: str) -> dict:
     return proxy
 
 
+def _build_httpx_proxy(proxy_config: dict | None) -> tuple[dict[str, str] | None, tuple[str, str] | None]:
+    if not proxy_config:
+        return None, None
+    server = proxy_config.get("server")
+    if not server:
+        return None, None
+
+    proxies = {"http://": server, "https://": server}
+    auth = None
+    username = proxy_config.get("username")
+    password = proxy_config.get("password")
+    if username is not None and password is not None:
+        auth = (username, password)
+    return proxies, auth
+
+
+async def _fetch_ip_metadata(proxies: dict[str, str] | None, auth: tuple[str, str] | None) -> dict:
+    if not proxies:
+        proxies = None
+    try:
+        async with httpx.AsyncClient(proxies=proxies, auth=auth, timeout=10.0) as client:
+            response = await client.get("https://ipinfo.io/json")
+            response.raise_for_status()
+            payload = response.json()
+            return {
+                "ip": payload.get("ip"),
+                "city": payload.get("city"),
+                "region": payload.get("region"),
+                "country": payload.get("country"),
+                "org": payload.get("org"),
+                "loc": payload.get("loc"),
+            }
+    except Exception as exc:
+        logging.warning("Failed to fetch IP metadata: %s", exc)
+    return {}
+
+
 async def scrape_monitor_snapshot(
     target_url: str,
     debug_prefix: str,
@@ -167,8 +205,9 @@ async def scrape_monitor_snapshot(
     cache_buster = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     request_url = _append_cache_buster(target_url, cache_buster)
     launch_kwargs: dict = {"headless": not headful}
-    if proxy_url:
-        launch_kwargs["proxy"] = _build_playwright_proxy(proxy_url)
+    proxy_config = _build_playwright_proxy(proxy_url) if proxy_url else None
+    if proxy_config:
+        launch_kwargs["proxy"] = proxy_config
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**launch_kwargs)
@@ -212,6 +251,15 @@ async def scrape_monitor_snapshot(
             for idx in indices:
                 recent_rows.append(await _parse_row(rows.nth(idx), idx))
 
+            cdn_metadata = {
+                "hostname": urlparse(page.url).hostname if page.url else None,
+                "server": response.headers.get("server") if response else None,
+                "via": response.headers.get("via") if response else None,
+                "cf_ray": response.headers.get("cf-ray") if response else None,
+            }
+            proxies, proxy_auth = _build_httpx_proxy(proxy_config)
+            ip_metadata = await _fetch_ip_metadata(proxies=proxies, auth=proxy_auth)
+
             return {
                 "target_url": target_url,
                 "request_url": request_url,
@@ -222,6 +270,8 @@ async def scrape_monitor_snapshot(
                 "row_order": row_order,
                 "latest_row": latest_row,
                 "recent_rows": _normalize_recent_rows(recent_rows),
+                "cdn_metadata": cdn_metadata,
+                "ip_metadata": ip_metadata,
             }
         except PlaywrightTimeoutError as exc:
             logging.error("Timeout while scraping monitor snapshot: %s", target_url)
